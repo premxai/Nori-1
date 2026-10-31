@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { expect } from "@playwright/test";
+import { eq } from "drizzle-orm";
 import type { Browser, BrowserContext, Page } from "playwright";
+import { jobs as jobsTable } from "@jobgraph/core";
 import { seedUser, startStack, type Seed, type Stack } from "../scripts/stack.mjs";
 import { WEB, launchBrowser, newSession } from "./helpers";
 
@@ -38,21 +40,33 @@ afterAll(async () => {
 const cards = () => page.locator("main article");
 
 describe("jobs", () => {
-  it("lists every role with its match and application state", async () => {
+  // The seeded user's lane comes from the onboarding titles ("Senior Frontend Engineer", "Frontend Engineer"), so Best
+  // match lists the three frontend roles (all applied to) and leaves out the backend one; Newest lists all four.
+  it("lists the roles that fit the lanes in Best match, and every open role in Newest", async () => {
     await page.goto(`${WEB}/jobs`);
-    await expect(cards()).toHaveCount(4);
-    await expect(page.getByText(/of 4 roles, best match first/)).toBeVisible();
+    await expect(cards()).toHaveCount(3);
+    await expect(page.getByText(/of 3 roles, best match first/)).toBeVisible();
     await expect(page.getByRole("link", { name: /Applied: Resume review/ })).toBeVisible();
     await expect(page.getByRole("link", { name: /Applied: Needs you/ })).toBeVisible();
     await expect(page.getByRole("link", { name: /Applied: Form review/ })).toBeVisible();
+    await expect(cards().filter({ hasText: "Backend Engineer" })).toHaveCount(0);
+    await expect(page.getByRole("link", { name: "Best match" })).toHaveAttribute("aria-current", "page");
+
+    await page.getByRole("link", { name: "Newest" }).click();
+    await expect(page).toHaveURL(/view=new/);
+    await expect(cards()).toHaveCount(4);
+    await expect(page.getByText(/of 4 roles, newest first/)).toBeVisible();
+    await expect(cards().first()).toContainText("Senior Frontend Engineer"); // posted most recently
     await expect(cards().filter({ hasText: "Backend Engineer" }).getByRole("button", { name: "Apply" })).toBeVisible();
   });
 
   it("filters by search text, and the filter lives in the URL", async () => {
+    await page.goto(`${WEB}/jobs?view=new`);
     await page.getByRole("searchbox", { name: "Search jobs" }).fill("backend");
     await expect(cards()).toHaveCount(1);
     await expect(cards().first()).toContainText("Backend Engineer");
     await expect(page).toHaveURL(/q=backend/);
+    await expect(page).toHaveURL(/view=new/); // the view survives the filter
     await page.getByRole("button", { name: "Clear filters" }).click();
     await expect(cards()).toHaveCount(4);
     await page.getByRole("searchbox", { name: "Search jobs" }).fill("zzz-nothing");
@@ -60,7 +74,20 @@ describe("jobs", () => {
     await page.getByRole("button", { name: "Clear filters" }).click();
   });
 
-  it("filters to remote roles, hides applied ones, and sorts", async () => {
+  it("points a search that Best match cannot answer at Newest", async () => {
+    await page.goto(`${WEB}/jobs`);
+    await page.getByRole("searchbox", { name: "Search jobs" }).fill("backend");
+    await expect(page.getByText("No roles match these filters")).toBeVisible();
+    await page.getByRole("link", { name: /Search every open role in Newest/ }).click();
+    await expect(page).toHaveURL(/view=new/);
+    await expect(page).toHaveURL(/q=backend/);
+    await expect(cards()).toHaveCount(1);
+    await expect(cards().first()).toContainText("Backend Engineer");
+  });
+
+  it("filters to remote roles, hides applied ones, and switches views", async () => {
+    await page.goto(`${WEB}/jobs?view=new`);
+    await expect(cards()).toHaveCount(4);
     await page.getByRole("switch", { name: /Remote only/ }).click();
     await expect(cards()).toHaveCount(2);
     await page.getByRole("switch", { name: /Remote only/ }).click();
@@ -68,17 +95,52 @@ describe("jobs", () => {
     await expect(cards()).toHaveCount(1);
     await expect(cards().first()).toContainText("Backend Engineer");
     await page.getByRole("switch", { name: /Hide applied/ }).click();
-    await page.getByLabel("Sort").selectOption("new");
-    await expect(page.getByLabel("Sort")).toHaveValue("new");
+    await page.getByRole("link", { name: "Best match" }).click();
+    await expect(page.getByText(/best match first/)).toBeVisible();
+    await expect(page).not.toHaveURL(/view=/);
+    await page.getByRole("link", { name: "Newest" }).click();
     await expect(page.getByText(/newest first/)).toBeVisible();
-    await page.getByLabel("Sort").selectOption("match");
     await page.getByLabel("Minimum match").selectOption("90");
     await expect(page).toHaveURL(/min=90/);
     await page.getByRole("button", { name: "Clear filters" }).click();
     await expect(cards()).toHaveCount(4);
   });
 
+  it("shows New today only for roles posted in the last 24 hours, and older postings only when asked", async () => {
+    await page.goto(`${WEB}/jobs?view=today`);
+    await expect(page.getByText("Nothing new in the last 24 hours")).toBeVisible();
+    await expect(cards()).toHaveCount(0);
+    // A role posted 90 days ago is outside the default 60-day window.
+    const [old] = await stack.db.insert(jobsTable).values({
+      companyName: "Oldco", atsType: "web", externalId: "old-1", title: "Frontend Engineer, Legacy", location: "Remote (US)", remote: true,
+      descriptionText: "Requirements:\n- React", applyUrl: "https://example.com/?job=old-1", postedAt: new Date(Date.now() - 90 * 86_400_000),
+    }).returning();
+    try {
+      await page.goto(`${WEB}/jobs?view=new`);
+      await expect(cards()).toHaveCount(4);
+      await expect(cards().filter({ hasText: "Legacy" })).toHaveCount(0);
+      await page.getByRole("switch", { name: /Include older postings/ }).click();
+      await expect(page).toHaveURL(/older=1/);
+      await expect(cards()).toHaveCount(5);
+    } finally {
+      await stack.db.delete(jobsTable).where(eq(jobsTable.id, old.id));
+    }
+  });
+
+  it("never leaves Best match empty: with no role fitting the lanes it shows the open roles and says so", async () => {
+    const stored = ((await api("/api/lanes")).json as { implicit?: boolean }[]).filter((l) => !l.implicit); // the onboarding-title lane is implicit: not stored
+    await api("/api/lanes", { method: "PUT", data: [{ name: "Astronaut", titles: ["Astronaut"], remote: "ok", minScore: 60 }] });
+    try {
+      await page.goto(`${WEB}/jobs`);
+      await expect(page.getByText(/No open role fits your lanes yet/)).toBeVisible();
+      await expect(cards()).toHaveCount(4);
+    } finally {
+      await api("/api/lanes", { method: "PUT", data: stored });
+    }
+  });
+
   it("opens a role in a drawer with the reasons, and closes it again", async () => {
+    await page.goto(`${WEB}/jobs`);
     await cards().filter({ hasText: "Senior Frontend Engineer" }).getByRole("link", { name: "Details" }).click();
     const drawer = page.getByRole("dialog");
     await expect(drawer).toBeVisible();
@@ -92,11 +154,11 @@ describe("jobs", () => {
   });
 
   it("applies to the one open role and lands on its review", async () => {
-    await page.goto(`${WEB}/jobs`);
+    await page.goto(`${WEB}/jobs?view=new`);
     await cards().filter({ hasText: "Backend Engineer" }).getByRole("button", { name: "Apply" }).click();
     await page.waitForURL(/\/applications\/[0-9a-f-]{36}$/, { timeout: 60_000 });
     await expect(page.getByRole("heading", { level: 1 })).toContainText("Backend Engineer");
-    await page.goto(`${WEB}/jobs`);
+    await page.goto(`${WEB}/jobs?view=new`);
     await expect(cards().filter({ hasText: "Backend Engineer" }).getByRole("link", { name: /Applied/ })).toBeVisible();
   });
 
@@ -266,7 +328,7 @@ describe("companies", () => {
     await page.goto(`${WEB}/companies`);
     const rows = page.getByRole("list", { name: "Companies" }).getByRole("listitem");
     await expect(rows).toHaveCount(60);
-    await expect(page.getByRole("status").filter({ hasText: /companies/ })).toContainText(/1\d\d companies/);
+    await expect(page.getByRole("status").filter({ hasText: /companies/ })).toContainText(/\d{3,} companies/); // the registry grows as boards are added: any three-digit count
     await expect(rows.first()).toContainText(/open role/);
   });
 

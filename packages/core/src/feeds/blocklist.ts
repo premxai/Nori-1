@@ -83,7 +83,7 @@ export async function purgeBlockedSources(db: Db): Promise<{ closedJobs: number;
   const byName = sql`regexp_replace(lower(${jobs.companyName}), '[^a-z0-9]', '', 'g') in (${sql.join(nameKeys.map((k) => sql`${k}`), sql`, `)})`;
   const closed = await db.update(jobs).set({ closedAt: new Date() })
     .where(and(isNull(jobs.closedAt), or(byName, ids.length ? inArray(jobs.companyId, ids) : undefined)))
-    .returning({ id: jobs.id });
+    .returning();
   if (ids.length) await db.delete(companies).where(inArray(companies.id, ids));
   return { closedJobs: closed.length, removedCompanies: ids.length };
 }

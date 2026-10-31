@@ -166,6 +166,13 @@ export function JobBoard({ items, apps, initial, view, viewQuery = "" }: {
     p.set("job", id);
     return `/jobs?${p}`;
   };
+  /** Same filters and switches, on the Newest view (which is not trimmed to the user's lanes). */
+  const newestHref = (() => {
+    const p = new URLSearchParams(params);
+    for (const [k, v] of new URLSearchParams(viewQuery)) p.set(k, v);
+    p.set("view", "new");
+    return `/jobs?${p}`;
+  })();
 
   return (
     <div className="flex flex-col gap-4">
@@ -226,6 +233,12 @@ export function JobBoard({ items, apps, initial, view, viewQuery = "" }: {
           {items.length === 0
             ? view === "today" ? "Check Newest for the latest postings, or come back later today." : "Poll a company's board or paste a posting link above to start."
             : "Loosen a filter, or add more roles above."}
+          {items.length > 0 && view === "best" && f.q.trim() && (
+            <>
+              {" "}Best match only lists roles that fit your lanes.{" "}
+              <Link href={newestHref} className="font-medium text-ink underline">Search every open role in Newest</Link>.
+            </>
+          )}
         </EmptyState>
       ) : (
         <>
